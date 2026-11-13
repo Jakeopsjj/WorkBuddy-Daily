@@ -4877,6 +4877,7 @@ CAMPAIGN_APP_BOOT = 120         # 一轮对话（含建沙箱）实测 10~40 秒
 CAMPAIGN_APP_WAIT = 30          # 对话结束后判据落库的轮询窗口
 CAMPAIGN_APP_POLL = 5
 CAMPAIGN_APP_PROMPT = '你只需要回复"Hi"'   # 判据只看「真跑完一轮」，让模型少生成
+CAMPAIGN_APP_MODEL = os.getenv("WORKBUDDY_APP_MODEL", "hy3")  # 任务对话模型：先选模型再发消息
 CAMPAIGN_APP_BOX_DOMAINS = (
     "tencent.com",
     "codebuddy.cn",
@@ -4919,6 +4920,20 @@ def _campaign_app_box_url(raw_url):
                for domain in CAMPAIGN_APP_BOX_DOMAINS):
         return ""
     return raw_url
+
+
+def _campaign_app_model_ack(payload, log):
+    """记录 session/set_model 的结果：先选择模型再发消息。"""
+    if not isinstance(payload, dict) or payload.get("id") != 3:
+        return
+    err = payload.get("error")
+    if isinstance(err, dict):
+        err = err.get("message") or err.get("code") or "unknown"
+    if err:
+        log("      ⚠️ 选择模型 %s 失败：%s（继续用默认模型）"
+            % (CAMPAIGN_APP_MODEL, str(err)[:60]))
+    else:
+        log("      🎛️ 已选择模型：%s" % CAMPAIGN_APP_MODEL)
 
 
 def _campaign_app_sse_payload(line):
@@ -5009,10 +5024,23 @@ def _campaign_app_chat(s, uid, nick, log, prompt=None):
     s2.trust_env = False
     stream = None
     try:
-        r = s2.post(CAMPAIGN_APP_HOST + "/v2/as/conversations/",
-                    json={"name": "开始新对话", "conversationOrigin": "agents"},
-                    headers=_campaign_app_headers(token, uid), timeout=60, verify=True)
-        data = (r.json() or {}).get("data") or {}
+        r = None
+        data = {}
+        for attempt in range(3):
+            r = s2.post(CAMPAIGN_APP_HOST + "/v2/as/conversations/",
+                        json={"name": "开始新对话", "conversationOrigin": "agents",
+                              "model": CAMPAIGN_APP_MODEL},
+                        headers=_campaign_app_headers(token, uid), timeout=60, verify=True)
+            if r.status_code == 200:
+                try:
+                    data = (r.json() or {}).get("data") or {}
+                except ValueError:
+                    data = {}
+                if data.get("session"):
+                    break
+            log("      · 建会话重试 %d/3：HTTP %s %s"
+                % (attempt + 1, r.status_code, (r.text or "")[:60].replace("\n", " ")))
+            time.sleep(5 * (attempt + 1))
         sess = data.get("session") or {}
         box, box_tok = sess.get("boxUrl") or "", sess.get("token") or ""
         if not box or not box_tok:
@@ -5033,7 +5061,9 @@ def _campaign_app_chat(s, uid, nick, log, prompt=None):
                                       "clientInfo": {"name": "WorkBuddyApp", "version": "2.8.0"}}},
             "sessionNew": {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                            "params": {"cwd": "/workspace", "mcpServers": [], "_meta": meta}},
-            "prompt": {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "setModel": {"jsonrpc": "2.0", "id": 3, "method": "session/set_model",
+                         "params": {"modelId": CAMPAIGN_APP_MODEL, "_meta": meta}},
+            "prompt": {"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
                        "params": {"prompt": [{"type": "text",
                                               "text": prompt or CAMPAIGN_APP_PROMPT}],
                                   "_meta": meta}},
@@ -5084,6 +5114,7 @@ def _campaign_app_chat(s, uid, nick, log, prompt=None):
             payload = _campaign_app_sse_payload(text)
             if payload is None:
                 continue
+            _campaign_app_model_ack(payload, log)
             reason, error = _campaign_app_terminal(payload)
             if error:
                 log("      ✗ 对话失败：收到错误事件 %s" % error[:60])
