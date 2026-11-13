@@ -34,12 +34,16 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Restore benefit guard
+      - name: Restore state (benefit guard + rotated tokens)
         uses: actions/cache@v4
         with:
-          path: workbuddy_benefit_state.json
-          key: workbuddy-benefit-state-${{ github.run_id }}
+          path: |
+            workbuddy_benefit_state.json
+            wb_refresh_tokens.json
+            wb_intl_tokens.json
+          key: workbuddy-state-${{ github.run_id }}
           restore-keys: |
+            workbuddy-state-
             workbuddy-benefit-state-
 
       - name: Detect account config
