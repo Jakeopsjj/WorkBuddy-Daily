@@ -33,7 +33,7 @@ jobs:
         if: github.event.inputs.mode == 'prepare'
         run: |
           python - <<'PY'
-          import json, sys
+          import sys
           sys.path.insert(0, '.')
           from workbuddy_intl_login import start_login
           d = start_login()
@@ -52,14 +52,20 @@ jobs:
           python - <<'PY'
           import os, sys
           sys.path.insert(0, '.')
-          from workbuddy_intl_login import poll_token, fetch_account
+          from workbuddy_intl_login import poll_token, _uid_of
           state = os.environ['WB_STATE']
           auth = poll_token(state, int(os.environ.get('WB_TIMEOUT', '1500')))
           at = auth['accessToken']; rt = auth.get('refreshToken') or ''
-          from workbuddy_intl_login import _uid_of
           uid = _uid_of(at)
-          print()
-          print('=' * 60)
-          print('WB_INTL_ENTRY: 账号1|' + at + '|' + str(uid) + '|' + rt)
-          print('=' * 60)
+          line = '账号1|' + at + '|' + uid + '|' + rt
+          with open('wb_intl_entry.txt', 'w', encoding='utf-8') as f:
+              f.write(line + '\n')
+          print('WB_INTL_ENTRY saved to artifact, uid =', uid)
           PY
+      - name: Upload token artifact
+        if: github.event.inputs.mode == 'collect'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wb-intl-entry
+          path: wb_intl_entry.txt
+          retention-days: 1
