@@ -3,9 +3,17 @@ name: WB Intl Login (device auth)
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "prepare=生成授权链接 / collect=轮询取令牌"
+        default: "prepare"
+        required: false
+      state:
+        description: "collect 模式下的 state"
+        default: ""
+        required: false
       timeout:
-        description: "等待授权秒数"
-        default: "900"
+        description: "collect 等待秒数"
+        default: "1500"
         required: false
 
 permissions:
@@ -14,13 +22,44 @@ permissions:
 jobs:
   login:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install requests
-      - name: Device auth login
+      - name: Prepare auth link
+        if: github.event.inputs.mode == 'prepare'
         run: |
-          python workbuddy_intl_login.py --no-open --timeout ${{ github.event.inputs.timeout || 900 }}
+          python - <<'PY'
+          import json, sys
+          sys.path.insert(0, '.')
+          from workbuddy_intl_login import start_login
+          d = start_login()
+          print()
+          print('=' * 60)
+          print('STATE: ' + d['state'])
+          print('AUTH_URL: ' + d['authUrl'])
+          print('=' * 60)
+          PY
+      - name: Collect token
+        if: github.event.inputs.mode == 'collect'
+        env:
+          WB_STATE: ${{ github.event.inputs.state }}
+          WB_TIMEOUT: ${{ github.event.inputs.timeout }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, '.')
+          from workbuddy_intl_login import poll_token, fetch_account
+          state = os.environ['WB_STATE']
+          auth = poll_token(state, int(os.environ.get('WB_TIMEOUT', '1500')))
+          at = auth['accessToken']; rt = auth.get('refreshToken') or ''
+          from workbuddy_intl_login import _uid_of
+          uid = _uid_of(at)
+          print()
+          print('=' * 60)
+          print('WB_INTL_ENTRY: 账号1|' + at + '|' + str(uid) + '|' + rt)
+          print('=' * 60)
+          PY
