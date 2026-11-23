@@ -307,6 +307,7 @@ LEVEL_TASK_CODES = {
     "first_chat", "skill_installed", "wechat_linked",
     "expert_summoned", "template_used",
 }
+_TASK_NOT_DELIVERED = "该账号未下发此任务"
 _EXPERT_ID_RE = re.compile(r"^ex_[A-Za-z0-9]{6,64}$")
 _TRUSTED_JUMP_HOST_SUFFIXES = ("workbuddy.cn", "codebuddy.cn", "tencent.com")
 
@@ -1436,7 +1437,8 @@ def _build_task_snapshot(s, log=None):
         ("level", "等级", None, "/activity/growth/tasks", False),
     )
     for key, label, headers, path, required in sources:
-        source = {"ok": False, "rows": [], "error": "", "required": required}
+        source = {"ok": False, "rows": [], "error": "", "required": required,
+                  "list_confirmed": False}
         try:
             response = s.get(BASE + path, timeout=25, verify=False, headers=headers)
             status_code = int(getattr(response, "status_code", 200) or 200)
@@ -1449,9 +1451,13 @@ def _build_task_snapshot(s, log=None):
             if code is not None and not _api_code_ok(code):
                 raise RuntimeError("code %s %s" % (
                     code, str(payload.get("msg") or "")[:40]))
-            batch = (payload.get("data") or {}).get("tasks") or []
+            raw_batch = (payload.get("data") or {}).get("tasks")
+            batch = raw_batch or []
             if not isinstance(batch, list):
                 raise RuntimeError("tasks 不是列表")
+            # 保持既有调度判定，但缺字段或损坏的列表不能作为未下发的证据。
+            source["list_confirmed"] = (
+                isinstance(raw_batch, list) and all(_task_code_of(row) for row in batch))
         except Exception as exc:
             source["error"] = str(exc)[:80]
             snapshot["errors"].append("%s: %s" % (label, source["error"]))
@@ -1469,6 +1475,8 @@ def _build_task_snapshot(s, log=None):
     snapshot["complete"] = all(
         snapshot["sources"].get(key, {}).get("ok")
         for key in ("desktop", "mp"))
+    snapshot["absence_confirmed"] = all(
+        snapshot["sources"][key]["list_confirmed"] for key in ("desktop", "mp"))
     snapshot["success"] = any(
         source.get("ok") for source in snapshot["sources"].values())
     if log and snapshot["errors"]:
@@ -1510,18 +1518,26 @@ def _task_snapshot_skip_reason(snapshot, code):
         until = (snapshot.get("locked") or {}).get(code)
         return "未到上线时间%s" % (("（%s）" % until) if until and until != "见任务页" else "")
     if snapshot.get("complete") and code not in (snapshot.get("have") or set()):
-        return "该账号未下发此任务"
+        if snapshot.get("absence_confirmed"):
+            return _TASK_NOT_DELIVERED
+        return "任务列表回执不完整，无法确认是否下发"
     return ""
 
 
-def _task_snapshot_group_skip_reason(snapshot, codes):
-    growth_codes = [str(code) for code in codes if _is_growth_task_code(code)]
-    if not growth_codes:
-        return ""
-    reasons = [_task_snapshot_skip_reason(snapshot, code) for code in growth_codes]
-    if all(reasons):
-        return "；".join(dict.fromkeys(reasons))
-    return ""
+def _task_snapshot_group_reasons(snapshot, codes):
+    return {str(code): _task_snapshot_skip_reason(snapshot, code)
+            for code in codes if _is_growth_task_code(code)}
+
+
+def _format_missing_growth_tasks(codes):
+    """完整名单只进运行日志，推送只保留计数。"""
+    groups = []
+    for label, is_mp in (("桌面", False), ("小程序", True)):
+        names = [task_cn(code) for code in sorted(codes)
+                 if (code in MP_TASK_CODES) == is_mp]
+        if names:
+            groups.append("%s %d 项：%s" % (label, len(names), "、".join(names)))
+    return "成长任务快照：未下发 %d 项（%s）" % (len(codes), "；".join(groups))
 
 
 def _task_snapshot_needs_action(snapshot, code, row=None, state=None):
@@ -1545,14 +1561,25 @@ def _task_snapshot_needs_action(snapshot, code, row=None, state=None):
     return _task_state_needs_action(*state)
 
 
-def _run_cloud_task(label, codes, fn, log, snapshot=None):
+def _run_cloud_task(label, codes, fn, log, snapshot=None, missing_growth=None):
     """执行一个云端子任务；快照确认无需动作时不发任何上游请求。"""
     if not want(*codes):
         log("   ⏭️ %s: 按配置跳过" % label)
         return None
-    reason = _task_snapshot_group_skip_reason(snapshot, codes)
-    if reason:
-        log("   ⏭️ %s: 快照跳过（%s）" % (label, reason))
+    reasons = _task_snapshot_group_reasons(snapshot, codes)
+    if missing_growth is not None:
+        missing_growth.update(code for code, reason in reasons.items()
+                              if reason == _TASK_NOT_DELIVERED)
+    if reasons and all(reasons.values()):
+        details = {code: reason for code, reason in reasons.items()
+                   if missing_growth is None or reason != _TASK_NOT_DELIVERED}
+        if details:
+            if len(details) == len(reasons):
+                detail = "；".join(dict.fromkeys(details.values()))
+            else:
+                detail = "；".join("%s：%s" % (task_cn(code), reason)
+                                  for code, reason in details.items())
+            log("   ⏭️ %s: 快照跳过（%s）" % (label, detail))
         return None
     try:
         result = fn()
@@ -6527,8 +6554,11 @@ def run_account(idx, acc, do_desktop):
             log("   ⚠️ 未包含任何「使用类」任务 → 成长中心的今日活跃（热力墙）不会点亮")
             log("      （签到/积分不受影响；想同时点亮热力墙建议保留一个对话类任务：WORKBUDDY_TASKS=checkin,travel,chat_5）")
 
+    missing_growth = set()
+
     def _run(label, codes, fn):
-        return _run_cloud_task(label, codes, fn, log, snapshot=task_snapshot)
+        return _run_cloud_task(label, codes, fn, log, snapshot=task_snapshot,
+                               missing_growth=missing_growth)
 
     # 前置：无 Buddy 实例时，其余任务 accept 会被服务端拒绝（prerequisite not met: first_buddy）
     first_row = _task_snapshot_row(task_snapshot, "first_buddy")
@@ -6609,6 +6639,10 @@ def run_account(idx, acc, do_desktop):
         t_unknown_tasks(s, uid, nick, log, snapshot=task_snapshot)
     except Exception as e:
         log("   ⚠️任务发现异常: %s" % str(e)[:80])
+    # 快照确认「该账号未下发」的成长任务只汇总一行，避免每天几十行噪声；
+    # 已下发但未完成/待领奖/锁定/需人工的项仍在上面逐条输出。
+    if missing_growth:
+        log("  🗂️ " + _format_missing_growth_tasks(missing_growth))
     # 领奖：按进度补领，不依赖 accept_status 的瞬时状态
     log("  🎁 ── 领奖 ──")
     claim_ready_tasks(s, log)
@@ -6640,6 +6674,7 @@ def run_account(idx, acc, do_desktop):
     )
     summary.update({"done": done, "total": len(st_all), "rest": rest,
                     "source_counts": source_counts,
+                    "missing_growth": sorted(missing_growth),
                     "level": prof2.get("level", "?"), "energy": energy})
     # 签到结论：供 WORKBUDDY_NOTIFY 判断本轮是否「正常」
     summary["checked_in"] = bool(_checkin_state.get("checked_in"))
@@ -6698,6 +6733,10 @@ def build_summary(summaries):
                      % (level, sm.get("checkin_streak", "?"), streak, energy))
         if source_text:
             lines.append("   🧭 任务行: %s" % source_text)
+        missing_growth = sm.get("missing_growth") or []
+        if missing_growth:
+            lines.append("   🗂️ 快照未下发 %d 项（本账号未投放，非漏执行）"
+                         % len(missing_growth))
         if str(streak).strip() in ("0", "0.0"):
             lines.append("      ℹ️ 活跃连签=0 属正常：它由成长中心「使用事件（热力墙）」驱动，与积分签到无关")
         if rest_cn:

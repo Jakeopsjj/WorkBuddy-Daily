@@ -3997,6 +3997,7 @@ class CampaignEventShapeTests(unittest.TestCase):
             "_campaign_app_terminal",
             "_campaign_app_machine",
             "_campaign_app_headers",
+            "_campaign_app_model_ack",
             "_campaign_app_chat",
             json=json,
             urlparse=urlparse,
@@ -4006,6 +4007,7 @@ class CampaignEventShapeTests(unittest.TestCase):
             time=actual_clock,
             CAMPAIGN_APP_HOST="https://copilot.tencent.com",
             CAMPAIGN_APP_BOOT=120,
+            CAMPAIGN_APP_MODEL="hy3",
             CAMPAIGN_APP_PROMPT='你只需要回复"Hi"',
             CAMPAIGN_APP_BOX_DOMAINS=assignment_value("CAMPAIGN_APP_BOX_DOMAINS"),
             CAMPAIGN_APP_SUCCESS_STOP_REASONS=assignment_value(

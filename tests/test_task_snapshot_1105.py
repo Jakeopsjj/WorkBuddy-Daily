@@ -91,7 +91,8 @@ def snapshot_namespace():
         "_task_snapshot_prog",
         "_is_growth_task_code",
         "_task_snapshot_skip_reason",
-        "_task_snapshot_group_skip_reason",
+        "_task_snapshot_group_reasons",
+        "_format_missing_growth_tasks",
         "_task_snapshot_needs_action",
         "_growth_task_rows",
         "_dynamic_expert_task_codes",
@@ -99,6 +100,8 @@ def snapshot_namespace():
         BASE=BASE,
         MP_HEADER=MP_HEADER,
         TASK_NAME_CN=names,
+        MP_TASK_CODES={"mp_only"},
+        _TASK_NOT_DELIVERED="该账号未下发此任务",
         REPORT_GAP=1.05,
         time=types.SimpleNamespace(sleep=lambda seconds: None),
     )
@@ -281,14 +284,14 @@ class TaskSnapshotTests(unittest.TestCase):
         self.assertTrue(module["_task_state_needs_action"]("", 0, 1))
         self.assertFalse(module["_task_state_needs_action"](
             "claimed", 1, 1))
-        self.assertTrue(
-            module["_task_snapshot_group_skip_reason"](
-                snapshot, ["done", "locked", "missing"]))
-        self.assertEqual(
-            "",
-            module["_task_snapshot_group_skip_reason"](
-                snapshot, ["active", "done"]),
-        )
+        reasons = module["_task_snapshot_group_reasons"](
+            snapshot, ["done", "locked", "missing"])
+        self.assertEqual({"done", "locked", "missing"}, set(reasons))
+        self.assertTrue(all(reasons.values()))
+        self.assertEqual("该账号未下发此任务", reasons["missing"])
+        mixed = module["_task_snapshot_group_reasons"](
+            snapshot, ["active", "done"])
+        self.assertFalse(all(mixed.values()))
 
     def test_not_accepted_pending_and_empty_full_progress_require_accept(self):
         module = snapshot_namespace()
@@ -699,6 +702,8 @@ class TaskSnapshotTests(unittest.TestCase):
                 self.assertEqual(2, session.failed_calls)
 
     def test_seventeen_terminal_tasks_do_not_add_scan_or_action_calls(self):
+        # 17 个终态任务（6 已领 + 6 锁定 + 5 未下发）都不发请求；但未下发的
+        # 5 项只记进汇总集合，不再逐条打印，明细保留 12 行。
         codes = ["done_%d" % i for i in range(6)]
         codes += ["locked_%d" % i for i in range(6)]
         codes += ["missing_%d" % i for i in range(5)]
@@ -738,23 +743,74 @@ class TaskSnapshotTests(unittest.TestCase):
             "_task_snapshot_prog",
             "_is_growth_task_code",
             "_task_snapshot_skip_reason",
-            "_task_snapshot_group_skip_reason",
+            "_task_snapshot_group_reasons",
+            "_format_missing_growth_tasks",
             "_task_snapshot_needs_action",
             "_run_cloud_task",
             BASE=BASE,
             MP_HEADER=MP_HEADER,
             TASK_NAME_CN={code: code for code in codes},
+            task_cn=lambda code: code,
+            MP_TASK_CODES=set(),
+            _TASK_NOT_DELIVERED="该账号未下发此任务",
             want=want,
             REPORT_GAP=1.05,
             time=types.SimpleNamespace(sleep=lambda seconds: None),
         )
+        missing_growth = set()
         for code in codes:
             runner["_run_cloud_task"](
-                code, [code], lambda: actions.append(code), logs.append, snapshot)
+                code, [code], lambda: actions.append(code), logs.append, snapshot,
+                missing_growth)
 
         self.assertEqual(3, len(session.calls))
         self.assertEqual([], actions)
-        self.assertEqual(17, sum("快照跳过" in line for line in logs))
+        self.assertEqual(12, sum("快照跳过" in line for line in logs))
+        self.assertEqual(set(codes[12:]), missing_growth)
+        self.assertTrue(all("未下发" not in line for line in logs))
+        self.assertIn("5 项", runner["_format_missing_growth_tasks"](missing_growth))
+
+    def test_mixed_group_keeps_detail_for_actionable_tasks(self):
+        """同组里既有锁定又有未下发时，锁定项仍要逐条说明，未下发项只入汇总。"""
+        session = ThreeSourceSession(
+            task_payload(
+                {"task_code": "locked_a", "accept_status": "accepted",
+                 "locked": True, "valid_start": "2026-12-01"},
+            ),
+            task_payload(),
+        )
+        module = snapshot_namespace()
+        module["TASK_NAME_CN"].update({"locked_a": "锁定甲"})
+        logs = []
+        snapshot = module["_build_task_snapshot"](session, logs.append)
+
+        runner = load_functions(
+            "_api_code_ok", "_as_int", "_task_code_of", "_task_status_of",
+            "_task_is_done", "_task_is_ready", "_task_row_needs_action",
+            "_task_state_needs_action", "_merge_task_snapshot_row",
+            "_task_snapshot_row", "_task_snapshot_prog", "_is_growth_task_code",
+            "_task_snapshot_skip_reason", "_task_snapshot_group_reasons",
+            "_task_snapshot_needs_action", "_run_cloud_task",
+            BASE=BASE, MP_HEADER=MP_HEADER,
+            TASK_NAME_CN={"locked_a": "锁定甲", "gone_b": "缺失乙"},
+            task_cn=lambda code: {"locked_a": "锁定甲", "gone_b": "缺失乙"}.get(code, code),
+            MP_TASK_CODES=set(),
+            _TASK_NOT_DELIVERED="该账号未下发此任务",
+            want=lambda *unused: True, REPORT_GAP=0,
+            time=types.SimpleNamespace(sleep=lambda seconds: None),
+        )
+        actions = []
+        missing_growth = set()
+        runner["_run_cloud_task"](
+            "混合组", ["locked_a", "gone_b"], lambda: actions.append("ran"),
+            logs.append, snapshot, missing_growth)
+
+        self.assertEqual([], actions)
+        self.assertEqual({"gone_b"}, missing_growth)
+        skipped = [line for line in logs if "快照跳过" in line]
+        self.assertEqual(1, len(skipped))
+        self.assertIn("锁定甲", skipped[0])
+        self.assertNotIn("缺失乙", skipped[0])
 
     def test_snapshot_error_is_visible_and_does_not_skip_unknown_codes(self):
         desktop = task_payload({
@@ -787,12 +843,13 @@ class TaskSnapshotTests(unittest.TestCase):
             "_task_snapshot_prog",
             "_is_growth_task_code",
             "_task_snapshot_skip_reason",
-            "_task_snapshot_group_skip_reason",
+            "_task_snapshot_group_reasons",
             "_task_snapshot_needs_action",
             "_run_cloud_task",
             BASE=BASE,
             MP_HEADER=MP_HEADER,
             TASK_NAME_CN={"missing": "missing"},
+            _TASK_NOT_DELIVERED="该账号未下发此任务",
             want=lambda *unused: True,
             REPORT_GAP=1.05,
             time=types.SimpleNamespace(sleep=lambda seconds: None),
