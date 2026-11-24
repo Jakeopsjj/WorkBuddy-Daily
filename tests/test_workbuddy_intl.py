@@ -140,7 +140,7 @@ class InternationalBehaviorTests(unittest.TestCase):
                 mock.patch.object(MODULE, "perform_growth_task_action") as action, \
                 mock.patch.object(MODULE, "claim_growth_task") as claim, \
                 redirect_stdout(output):
-            result = MODULE.run_growth_tasks("token", "uid")
+            result = MODULE.run_growth_tasks("token", "uid", experimental=True)
 
         self.assertEqual([("wechat_linked", "需客户端绑定微信")], result)
         action.assert_not_called()
@@ -153,7 +153,7 @@ class InternationalBehaviorTests(unittest.TestCase):
         with mock.patch.object(MODULE, "fetch_growth_tasks", return_value=(rows, [])), \
                 mock.patch.object(MODULE, "claim_growth_task") as claim, \
                 redirect_stdout(output):
-            result = MODULE.run_growth_tasks("token", "uid")
+            result = MODULE.run_growth_tasks("token", "uid", experimental=True)
 
         claim.assert_not_called()
         self.assertEqual([("wechat_linked", "服务端已达标，需官方客户端确认绑定")], result)
@@ -249,11 +249,78 @@ class InternationalBehaviorTests(unittest.TestCase):
                 mock.patch.object(MODULE, "_wait_growth_task", return_value=unchanged), \
                 mock.patch.object(MODULE, "claim_growth_task") as claim, \
                 redirect_stdout(output):
-            result = MODULE.run_growth_tasks("token", "uid")
+            result = MODULE.run_growth_tasks("token", "uid", experimental=True)
 
         claim.assert_not_called()
         self.assertIn("状态未变", result[0][1])
         self.assertIn("不冒领", output.getvalue())
+
+    def test_international_growth_tasks_are_read_only_by_default(self):
+        output = io.StringIO()
+        rows = {"first_chat": {"code": "first_chat", "status": "available"}}
+        with mock.patch.object(MODULE, "fetch_growth_tasks", return_value=(rows, [])), \
+                mock.patch.object(MODULE, "perform_growth_task_action") as action, \
+                mock.patch.object(MODULE, "claim_growth_task") as claim, \
+                redirect_stdout(output):
+            result = MODULE.run_growth_tasks("token", "uid")
+
+        action.assert_not_called()
+        claim.assert_not_called()
+        self.assertIn("只读", result[0][1])
+        self.assertIn("未开放自动任务事件", output.getvalue())
+
+    def test_report_growth_events_requires_explicit_zero_code(self):
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+
+            def post(self, *args, **kwargs):
+                return Response(200, {})
+
+        with mock.patch.object(MODULE.requests, "Session", FakeSession):
+            ok, note = MODULE.report_growth_events(
+                "token", "uid", [{"eventCode": "first_chat"}])
+
+        self.assertFalse(ok)
+        self.assertIn("code=None", note)
+
+    def test_credit_total_sums_precise_and_legacy_fields(self):
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+
+            def post(self, *args, **kwargs):
+                return Response(200, {
+                    "code": 0,
+                    "data": {"Packages": [
+                        {"CycleRemainCapacity": 10},
+                        {"CycleRemainCapacityPrecise": "2.5"},
+                    ]},
+                })
+
+        with mock.patch.object(MODULE.requests, "Session", FakeSession):
+            total, error = MODULE.query_credit_total("token", "uid")
+
+        self.assertEqual(12.5, total)
+        self.assertEqual("", error)
+
+    def test_inactive_activity_does_not_promise_credits(self):
+        text = MODULE.day_completed_note(
+            "活动已关闭", True, False, False, False, True, True)
+
+        self.assertIn("积分未确认", text)
+        self.assertNotIn("异步发放", text)
+
+    def test_claim_daily_marks_delayed_credit_without_claiming_arrival(self):
+        response = Response(200, {
+            "code": 0,
+            "data": {"credit": 30, "credit_delayed": True},
+        })
+        with mock.patch.object(MODULE, "post_json", return_value=response):
+            ok, note = MODULE.claim_daily("token", "uid")
+
+        self.assertTrue(ok)
+        self.assertIn("待入账", note)
 
     def test_completed_task_is_claimed_only_after_readback(self):
         output = io.StringIO()
@@ -266,7 +333,7 @@ class InternationalBehaviorTests(unittest.TestCase):
                 mock.patch.object(MODULE, "claim_growth_task",
                                   return_value=(True, "已领取（回读确认）")) as claim, \
                 redirect_stdout(output):
-            result = MODULE.run_growth_tasks("token", "uid")
+            result = MODULE.run_growth_tasks("token", "uid", experimental=True)
 
         claim.assert_called_once_with("token", "uid", "template_used")
         self.assertEqual([("template_used", "已领取（回读确认）")], result)
@@ -409,7 +476,9 @@ class InternationalBehaviorTests(unittest.TestCase):
             'data: {"id":"cmb-real","choices":[{"delta":{"content":"OK"}}]}',
             "data: [DONE]",
         ]
-        response = StreamResponse(200, {}, lines)
+        create_response = Response(
+            200, {"code": 0, "data": {"conversationId": "conv-real"}})
+        chat_response = StreamResponse(200, {}, lines)
 
         class FakeSession:
             def __init__(self):
@@ -418,18 +487,11 @@ class InternationalBehaviorTests(unittest.TestCase):
 
             def post(self, url, **kwargs):
                 self.post_calls.append((url, kwargs))
-                return response
+                return create_response if len(self.post_calls) == 1 else chat_response
 
         session = FakeSession()
-        captured = {}
-
-        def create_session(token, uid, prompt="Hi", session=None):
-            captured["create_session"] = session
-            return True, "ok", {"id": "conv-real"}, "model-x"
-
-        with mock.patch.object(MODULE, "web_conversation_session",
-                               side_effect=create_session), \
-                mock.patch.object(MODULE.requests, "Session", return_value=session):
+        with mock.patch.object(MODULE.requests, "Session", return_value=session), \
+                mock.patch.object(MODULE, "model_chain", return_value=["model-x"]):
             ok, note, data, model = MODULE.web_task_conversation_session(
                 "token", "uid", "hello", metadata={"userId": "uid"})
 
@@ -438,13 +500,55 @@ class InternationalBehaviorTests(unittest.TestCase):
         self.assertEqual("conv-real", data["id"])
         self.assertEqual("cmb-real", data["messageId"])
         self.assertEqual("model-x", model)
-        self.assertTrue(session.post_calls[0][0].endswith("/console/chat/completions"))
-        self.assertEqual("text/event-stream", session.post_calls[0][1]["headers"]["Accept"])
-        self.assertEqual("uid", session.post_calls[0][1]["json"]["_meta"]["userId"])
-        self.assertIs(session, captured["create_session"])
+        self.assertTrue(session.post_calls[0][0].endswith("/console/webchat/conversations"))
+        self.assertIn("WorkBuddy task-", session.post_calls[0][1]["json"]["name"])
+        self.assertTrue(session.post_calls[1][0].endswith("/console/chat/completions"))
+        self.assertEqual("conv-real", session.post_calls[1][1]["json"]["conversationId"])
+        self.assertEqual(
+            [
+                {"role": "system", "content": MODULE.SYSTEM_PROMPT},
+                {"role": "user", "content": "hello"},
+            ],
+            session.post_calls[1][1]["json"]["messages"],
+        )
+        self.assertEqual("text/event-stream", session.post_calls[1][1]["headers"]["Accept"])
+        self.assertEqual(MODULE.BASE + "/", session.post_calls[1][1]["headers"]["Referer"])
+        self.assertEqual(
+            "web", session.post_calls[1][1]["headers"]["X-Client-Platform"])
+        self.assertEqual("uid", session.post_calls[1][1]["json"]["_meta"]["userId"])
+
+    def test_web_task_conversation_400_includes_server_reason(self):
+        create_response = Response(
+            200, {"code": 0, "data": {"conversationId": "conv-real"}})
+        bad_response = Response(
+            400,
+            {"code": 400001, "msg": "request data invalid"},
+            text='{"code":400001,"msg":"request data invalid"}',
+        )
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+                self.post_calls = []
+
+            def post(self, url, **kwargs):
+                self.post_calls.append((url, kwargs))
+                return create_response if len(self.post_calls) == 1 else bad_response
+
+        with mock.patch.object(MODULE.requests, "Session", return_value=FakeSession()), \
+                mock.patch.object(MODULE, "model_chain", return_value=["model-x"]):
+            ok, note, _data, _model = MODULE.web_task_conversation_session(
+                "token", "uid", "hello")
+
+        self.assertFalse(ok)
+        self.assertIn("HTTP 400", note)
+        self.assertIn("code=400001", note)
+        self.assertIn("request data invalid", note)
 
     def test_web_task_conversation_without_message_id_fails(self):
-        response = StreamResponse(200, {}, [
+        create_response = Response(
+            200, {"code": 0, "data": {"conversationId": "conv-real"}})
+        chat_response = StreamResponse(200, {}, [
             'data: {"choices":[{"delta":{"content":"OK"}}]}',
             "data: [DONE]",
         ])
@@ -452,18 +556,42 @@ class InternationalBehaviorTests(unittest.TestCase):
         class FakeSession:
             def __init__(self):
                 self.trust_env = True
+                self.count = 0
 
             def post(self, *args, **kwargs):
-                return response
+                self.count += 1
+                return create_response if self.count == 1 else chat_response
 
-        with mock.patch.object(MODULE, "web_conversation_session",
-                               return_value=(True, "ok", {"id": "conv-real"}, "model-x")), \
-                mock.patch.object(MODULE.requests, "Session", FakeSession):
+        with mock.patch.object(MODULE.requests, "Session", FakeSession), \
+                mock.patch.object(MODULE, "model_chain", return_value=["model-x"]):
             ok, note, _data, _model = MODULE.web_task_conversation_session(
                 "token", "uid", "hello")
 
         self.assertFalse(ok)
         self.assertIn("messageId", note)
+
+    def test_fetch_task_scene_uses_public_english_endpoint(self):
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+                self.get_calls = []
+
+            def get(self, url, **kwargs):
+                self.get_calls.append((url, kwargs))
+                return Response(200, {
+                    "code": 0,
+                    "data": {"scenes": [{"id": 1, "name": "Slides Creation"}]},
+                })
+
+        session = FakeSession()
+        with mock.patch.object(MODULE.requests, "Session", return_value=session):
+            scene, error = MODULE.fetch_task_scene("token", "uid")
+
+        self.assertEqual("", error)
+        self.assertEqual("1", scene["id"])
+        self.assertTrue(session.get_calls[0][0].endswith(
+            "/v2/as/support/scenes?locale=en"))
+        self.assertNotIn("Authorization", session.get_calls[0][1]["headers"])
 
     def test_install_skill_requires_installed_readback(self):
         sources = Response(200, {
@@ -543,7 +671,7 @@ class InternationalBehaviorTests(unittest.TestCase):
                 mock.patch.object(MODULE, "perform_growth_task_action") as action, \
                 redirect_stdout(output):
             result = MODULE.run_growth_tasks(
-                "token", "uid", allow_web=False)
+                "token", "uid", allow_web=False, experimental=True)
 
         action.assert_not_called()
         self.assertEqual([("first_chat", "已跳过（--no-keepalive）")], result)
